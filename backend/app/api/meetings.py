@@ -9,12 +9,14 @@ from datetime import datetime
 import logging
 
 from app.db.session import get_db
-from app.models.database import User, Meeting, MeetingMinutes
+from app.models.database import User, Meeting, MeetingMinutes, MeetingShare
 from app.models.schemas import (
     MeetingCreate, MeetingResponse, MeetingDetail,
-    DialogueLine, MeetingFinal, AgentConfig
+    DialogueLine, MeetingFinal, AgentConfig,
+    MeetingShareCreate, MeetingShareResponse, MeetingResponseWithSharing
 )
 from app.utils.auth import get_current_active_user
+from app.utils.permissions import PermissionChecker
 from app.core.simulator import run_meeting
 from app.core.simulator_streaming import run_meeting_streaming
 
@@ -46,23 +48,69 @@ def create_meeting(
     return db_meeting
 
 
-@router.get("", response_model=List[MeetingResponse])
+@router.get("", response_model=List[MeetingResponseWithSharing])
 def get_meetings(
     skip: int = 0,
     limit: int = 100,
+    filter: str = "active",  # active, archived, all
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get all meetings for current user"""
-    meetings = (
-        db.query(Meeting)
-        .filter(Meeting.user_id == current_user.id)
-        .order_by(Meeting.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .all()
+    """Get all meetings for current user (owned + shared)"""
+    # Get owned meetings with filter
+    owned_query = db.query(Meeting).filter(Meeting.user_id == current_user.id)
+    
+    if filter == "archived":
+        owned_query = owned_query.filter(Meeting.is_archived == True)
+    elif filter == "active":
+        owned_query = owned_query.filter(Meeting.is_archived == False)
+    
+    owned_meetings = owned_query.all()
+    
+    # Get shared meetings
+    shared_query = (
+        db.query(Meeting, MeetingShare, User)
+        .join(MeetingShare, Meeting.id == MeetingShare.meeting_id)
+        .join(User, Meeting.user_id == User.id)
+        .filter(MeetingShare.shared_with_user_id == current_user.id)
     )
-    return meetings
+    
+    shared_results = shared_query.all()
+    
+    # Build response list
+    meetings_response = []
+    
+    # Add owned meetings
+    for meeting in owned_meetings:
+        meetings_response.append({
+            **meeting.__dict__,
+            "is_shared": False,
+            "is_owner": True,
+            "shared_by": None,
+            "is_archived": meeting.is_archived
+        })
+    
+    # Add shared meetings
+    for meeting, share, owner in shared_results:
+        # Apply filter for shared meetings
+        if filter == "archived" and not share.is_archived:
+            continue
+        if filter == "active" and share.is_archived:
+            continue
+            
+        meetings_response.append({
+            **meeting.__dict__,
+            "is_shared": True,
+            "is_owner": False,
+            "shared_by": owner.email,
+            "is_archived": share.is_archived
+        })
+    
+    # Sort by created_at desc
+    meetings_response.sort(key=lambda x: x.get("created_at", datetime.min), reverse=True)
+    
+    # Apply pagination
+    return meetings_response[skip:skip+limit]
 
 
 @router.get("/{meeting_id}", response_model=MeetingDetail)
@@ -80,11 +128,21 @@ def get_meeting(
             detail="Meeting not found"
         )
     
-    if meeting.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to access this meeting"
-        )
+    # Check if user owns the meeting OR has shared access
+    is_owner = meeting.user_id == current_user.id
+    
+    if not is_owner:
+        # Check if meeting is shared with this user
+        share = db.query(MeetingShare).filter(
+            MeetingShare.meeting_id == meeting_id,
+            MeetingShare.shared_with_user_id == current_user.id
+        ).first()
+        
+        if not share:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this meeting"
+            )
     
     return {
         **meeting.__dict__,
@@ -162,14 +220,31 @@ async def stream_meeting(
             detail="Meeting not found"
         )
     
-    if meeting.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to access this meeting"
-        )
+    # Check if user owns the meeting OR has shared access
+    is_owner = meeting.user_id == current_user.id
     
-    # Allow rerunning completed meetings by resetting dialogue and status
-    if meeting.status == "completed" or meeting.status == "cancelled":
+    if not is_owner:
+        # Check if meeting is shared with this user
+        share = db.query(MeetingShare).filter(
+            MeetingShare.meeting_id == meeting_id,
+            MeetingShare.shared_with_user_id == current_user.id
+        ).first()
+        
+        if not share:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this meeting"
+            )
+        
+        # Shared users cannot re-run meetings, only view
+        if meeting.status == "completed" or meeting.status == "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only the owner can re-run a meeting"
+            )
+    
+    # Allow rerunning completed meetings (owner only)
+    if is_owner and (meeting.status == "completed" or meeting.status == "cancelled"):
         meeting.dialogue = []
         meeting.decision = None
         meeting.summary = None
@@ -180,8 +255,9 @@ async def stream_meeting(
     async def event_generator():
         """Generate SSE events for meeting simulation"""
         try:
-            # Update meeting status to running
+            # Update meeting status to running and increment run count
             meeting.status = "running"
+            meeting.run_count = (meeting.run_count or 0) + 1
             db.commit()
             
             # Prepare agents configuration
@@ -256,21 +332,31 @@ async def stream_meeting(
             
             # Create meeting minutes if completed successfully
             if meeting.status == "completed" and final_result:
-                minutes = MeetingMinutes(
-                    meeting_id=meeting.id,
-                    user_id=meeting.user_id,
-                    title=meeting.title,
-                    issue=meeting.issue,
-                    decision=meeting.decision,
-                    summary=meeting.summary,
-                    full_transcript=meeting.dialogue,
-                    participants=[agent['name'] for agent in meeting.agents_config],
-                    options_discussed=meeting.options_summary,
-                    metrics=meeting.metrics,
-                    meeting_date=meeting.completed_at
-                )
-                db.add(minutes)
-                db.commit()
+                try:
+                    logger.info(f"Creating minutes for meeting {meeting_id}")
+                    minutes = MeetingMinutes(
+                        meeting_id=meeting.id,
+                        user_id=meeting.user_id,
+                        title=meeting.title,
+                        issue=meeting.issue,
+                        decision=meeting.decision or "No decision recorded",
+                        summary=meeting.summary or "Meeting completed without summary",
+                        full_transcript=meeting.dialogue or [],
+                        participants=[agent['name'] for agent in meeting.agents_config],
+                        options_discussed=meeting.options_summary or "No options recorded",
+                        metrics=meeting.metrics or {},
+                        meeting_date=meeting.completed_at
+                    )
+                    db.add(minutes)
+                    db.commit()
+                    db.refresh(minutes)
+                    logger.info(f"Successfully created minutes with ID {minutes.id} for meeting {meeting_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create minutes for meeting {meeting_id}: {e}", exc_info=True)
+                    # Don't fail the meeting completion if minutes creation fails
+                    db.rollback()
+            else:
+                logger.warning(f"Minutes not created for meeting {meeting_id}: status={meeting.status}, final_result={'present' if final_result else 'missing'}")
             
             # Clean up
             if meeting_id in stream_meeting.active_simulations:
@@ -365,3 +451,212 @@ def stop_meeting(
         meeting.status = "cancelled"
         db.commit()
         return {"message": "Meeting marked as cancelled"}
+
+
+# ============ Sharing Endpoints ============
+
+@router.post("/{meeting_id}/share", response_model=List[MeetingShareResponse])
+def share_meeting(
+    meeting_id: int,
+    share_data: MeetingShareCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Share a meeting with other users by email"""
+    # Verify meeting exists and user owns it
+    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting not found"
+        )
+    
+    if meeting.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to share this meeting"
+        )
+    
+    # Find users by email and create shares
+    shares_created = []
+    for email in share_data.user_emails:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            continue  # Skip invalid emails
+        
+        if user.id == current_user.id:
+            continue  # Skip sharing with self
+        
+        # Check sharing restrictions
+        if not PermissionChecker.can_share_with_user(current_user, user):
+            continue  # Skip users that violate sharing restrictions
+        
+        # Check if already shared
+        existing = db.query(MeetingShare).filter(
+            MeetingShare.meeting_id == meeting_id,
+            MeetingShare.shared_with_user_id == user.id
+        ).first()
+        
+        if existing:
+            continue  # Already shared
+        
+        # Create share
+        share = MeetingShare(
+            meeting_id=meeting_id,
+            shared_with_user_id=user.id
+        )
+        db.add(share)
+        db.flush()
+        
+        shares_created.append({
+            **share.__dict__,
+            "shared_with_email": user.email,
+            "shared_with_name": user.full_name
+        })
+    
+    db.commit()
+    return shares_created
+
+
+@router.get("/{meeting_id}/shares", response_model=List[MeetingShareResponse])
+def get_meeting_shares(
+    meeting_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get list of users a meeting is shared with"""
+    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting not found"
+        )
+    
+    if meeting.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to view shares for this meeting"
+        )
+    
+    shares = (
+        db.query(MeetingShare, User)
+        .join(User, MeetingShare.shared_with_user_id == User.id)
+        .filter(MeetingShare.meeting_id == meeting_id)
+        .all()
+    )
+    
+    return [
+        {
+            **share.__dict__,
+            "shared_with_email": user.email,
+            "shared_with_name": user.full_name
+        }
+        for share, user in shares
+    ]
+
+
+@router.delete("/{meeting_id}/share/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unshare_meeting(
+    meeting_id: int,
+    user_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Remove sharing access for a user"""
+    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Meeting not found"
+        )
+    
+    if meeting.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to modify shares for this meeting"
+        )
+    
+    share = db.query(MeetingShare).filter(
+        MeetingShare.meeting_id == meeting_id,
+        MeetingShare.shared_with_user_id == user_id
+    ).first()
+    
+    if share:
+        db.delete(share)
+        db.commit()
+    
+    return None
+
+
+@router.post("/{meeting_id}/archive", status_code=status.HTTP_200_OK)
+def archive_meeting(
+    meeting_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Archive a meeting (owned or shared) in current user's workspace"""
+    # Check if it's an owned meeting
+    meeting = db.query(Meeting).filter(
+        Meeting.id == meeting_id,
+        Meeting.user_id == current_user.id
+    ).first()
+    
+    if meeting:
+        # Archive owned meeting
+        meeting.is_archived = True
+        db.commit()
+        return {"message": "Meeting archived"}
+    
+    # Check if it's a shared meeting
+    share = db.query(MeetingShare).filter(
+        MeetingShare.meeting_id == meeting_id,
+        MeetingShare.shared_with_user_id == current_user.id
+    ).first()
+    
+    if share:
+        # Archive shared meeting
+        share.is_archived = True
+        db.commit()
+        return {"message": "Meeting archived"}
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Meeting not found"
+    )
+
+
+@router.post("/{meeting_id}/unarchive", status_code=status.HTTP_200_OK)
+def unarchive_meeting(
+    meeting_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Unarchive a meeting (owned or shared) in current user's workspace"""
+    # Check if it's an owned meeting
+    meeting = db.query(Meeting).filter(
+        Meeting.id == meeting_id,
+        Meeting.user_id == current_user.id
+    ).first()
+    
+    if meeting:
+        # Unarchive owned meeting
+        meeting.is_archived = False
+        db.commit()
+        return {"message": "Meeting restored"}
+    
+    # Check if it's a shared meeting
+    share = db.query(MeetingShare).filter(
+        MeetingShare.meeting_id == meeting_id,
+        MeetingShare.shared_with_user_id == current_user.id
+    ).first()
+    
+    if share:
+        # Unarchive shared meeting
+        share.is_archived = False
+        db.commit()
+        return {"message": "Meeting restored"}
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Meeting not found"
+    )

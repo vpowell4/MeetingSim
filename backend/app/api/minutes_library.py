@@ -24,6 +24,7 @@ class MinutesResponse(BaseModel):
     participants: List[str]
     meeting_date: datetime
     created_at: datetime
+    is_archived: bool = False
     
     class Config:
         from_attributes = True
@@ -42,11 +43,17 @@ def get_all_minutes(
     skip: int = 0,
     limit: int = 100,
     search: Optional[str] = Query(None, description="Search in title or issue"),
+    filter: str = Query("active", description="Filter by status: active, archived"),
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """Get all meeting minutes for current user"""
     query = db.query(MeetingMinutes).filter(MeetingMinutes.user_id == current_user.id)
+    
+    if filter == "active":
+        query = query.filter(MeetingMinutes.is_archived == False)
+    elif filter == "archived":
+        query = query.filter(MeetingMinutes.is_archived == True)
     
     if search:
         search_filter = f"%{search}%"
@@ -108,3 +115,51 @@ def delete_minutes(
     db.commit()
     
     return {"message": "Minutes deleted successfully"}
+
+
+@router.post("/{minutes_id}/archive", status_code=status.HTTP_200_OK)
+def archive_minutes(
+    minutes_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Archive meeting minutes"""
+    minutes = db.query(MeetingMinutes).filter(
+        MeetingMinutes.id == minutes_id,
+        MeetingMinutes.user_id == current_user.id
+    ).first()
+    
+    if not minutes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Minutes not found"
+        )
+    
+    minutes.is_archived = True
+    db.commit()
+    
+    return {"message": "Minutes archived successfully"}
+
+
+@router.post("/{minutes_id}/unarchive", status_code=status.HTTP_200_OK)
+def unarchive_minutes(
+    minutes_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Unarchive meeting minutes"""
+    minutes = db.query(MeetingMinutes).filter(
+        MeetingMinutes.id == minutes_id,
+        MeetingMinutes.user_id == current_user.id
+    ).first()
+    
+    if not minutes:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Minutes not found"
+        )
+    
+    minutes.is_archived = False
+    db.commit()
+    
+    return {"message": "Minutes restored successfully"}

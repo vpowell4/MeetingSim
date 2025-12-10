@@ -1,5 +1,5 @@
 """People Library API endpoints"""
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -13,16 +13,19 @@ router = APIRouter()
 
 @router.get("", response_model=List[AgentProfileResponse])
 def get_agent_profiles(
+    filter: str = Query("active", description="Filter by status: active, archived"),
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """Get all people profiles for current user"""
-    profiles = (
-        db.query(AgentProfile)
-        .filter(AgentProfile.user_id == current_user.id)
-        .order_by(AgentProfile.name)
-        .all()
-    )
+    query = db.query(AgentProfile).filter(AgentProfile.user_id == current_user.id)
+    
+    if filter == "active":
+        query = query.filter(AgentProfile.is_archived == False)
+    elif filter == "archived":
+        query = query.filter(AgentProfile.is_archived == True)
+    
+    profiles = query.order_by(AgentProfile.name).all()
     return profiles
 
 
@@ -52,7 +55,9 @@ def create_agent_profile(
         persona=profile_data.persona,
         default_stance=profile_data.default_stance,
         default_dominance=profile_data.default_dominance,
-        traits=profile_data.traits
+        traits=profile_data.traits,
+        goals=profile_data.goals,
+        criteria=profile_data.criteria
     )
     db.add(db_profile)
     db.commit()
@@ -133,6 +138,10 @@ def update_agent_profile(
         profile.default_dominance = profile_update.default_dominance
     if profile_update.traits is not None:
         profile.traits = profile_update.traits
+    if profile_update.goals is not None:
+        profile.goals = profile_update.goals
+    if profile_update.criteria is not None:
+        profile.criteria = profile_update.criteria
     
     db.commit()
     db.refresh(profile)
@@ -165,3 +174,57 @@ def delete_agent_profile(
     db.commit()
     
     return None
+
+
+@router.post("/{profile_id}/archive", status_code=status.HTTP_200_OK)
+def archive_agent_profile(
+    profile_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Archive an agent profile"""
+    profile = db.query(AgentProfile).filter(AgentProfile.id == profile_id).first()
+    
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent profile not found"
+        )
+    
+    if profile.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to archive this profile"
+        )
+    
+    profile.is_archived = True
+    db.commit()
+    
+    return {"message": "Agent profile archived successfully"}
+
+
+@router.post("/{profile_id}/unarchive", status_code=status.HTTP_200_OK)
+def unarchive_agent_profile(
+    profile_id: int,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Unarchive an agent profile"""
+    profile = db.query(AgentProfile).filter(AgentProfile.id == profile_id).first()
+    
+    if not profile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent profile not found"
+        )
+    
+    if profile.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to unarchive this profile"
+        )
+    
+    profile.is_archived = False
+    db.commit()
+    
+    return {"message": "Agent profile restored successfully"}

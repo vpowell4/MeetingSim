@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Auth
     SECRET_KEY: str = ""
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours (was 7 days - reduced for security)
     
     # Firebase (for future migration)
     FIREBASE_PROJECT_ID: Optional[str] = None
@@ -61,6 +61,15 @@ if not settings.OPENAI_API_KEY:
 if not settings.OPENAI_API_KEY:
     import warnings
     warnings.warn("OPENAI_API_KEY not set. Please configure .env file or set environment variable.")
+
 if not settings.SECRET_KEY:
-    import warnings
-    warnings.warn("SECRET_KEY not set. Please configure .env file.")
+    if not settings.DEBUG:
+        raise ValueError(
+            "SECRET_KEY must be set in production. "
+            "Add SECRET_KEY to your .env file or set as environment variable. "
+            "Generate a secure key with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        )
+    else:
+        import warnings
+        warnings.warn("SECRET_KEY not set. Using insecure default for development only.")
+        settings.SECRET_KEY = "dev-secret-key-CHANGE-IN-PRODUCTION"

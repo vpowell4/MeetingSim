@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.database import User
+from app.models.database import User, Organization
 from app.models.schemas import UserCreate, UserLogin, UserResponse, Token
 from app.utils.auth import (
     get_password_hash,
@@ -19,6 +19,13 @@ router = APIRouter()
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 def register(user_data: UserCreate, db: Session = Depends(get_db)):
     """Register a new user"""
+    # Validate password strength
+    if len(user_data.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long"
+        )
+    
     # Check if user already exists
     existing_user = db.query(User).filter(User.email == user_data.email).first()
     if existing_user:
@@ -27,12 +34,32 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="Email already registered"
         )
     
+    # Extract organization from email domain
+    email_domain = user_data.email.split('@')[1] if '@' in user_data.email else None
+    organization_id = None
+    
+    if email_domain:
+        # Check if organization exists for this domain
+        org = db.query(Organization).filter(Organization.name == email_domain).first()
+        
+        if not org:
+            # Create organization automatically
+            org = Organization(
+                name=email_domain,
+                description=f"Auto-created from email domain @{email_domain}"
+            )
+            db.add(org)
+            db.flush()  # Get the ID without committing yet
+        
+        organization_id = org.id
+    
     # Create new user
     hashed_password = get_password_hash(user_data.password)
     db_user = User(
         email=user_data.email,
         full_name=user_data.full_name,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        organization_id=organization_id
     )
     db.add(db_user)
     db.commit()

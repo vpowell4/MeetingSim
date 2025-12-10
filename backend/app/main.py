@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.config import settings
-from app.api import auth, meetings, users, agent_library
+from app.api import auth, meetings, users, agent_library, organizations, departments
 from app.api import minutes_library
 from app.db.session import engine, Base
 from app.utils.logger import setup_logging
@@ -49,8 +49,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.BACKEND_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -77,6 +77,8 @@ async def health_check():
 # Include routers
 app.include_router(auth.router, prefix=f"{settings.API_PREFIX}/auth", tags=["auth"])
 app.include_router(users.router, prefix=f"{settings.API_PREFIX}/users", tags=["users"])
+app.include_router(organizations.router, prefix=f"{settings.API_PREFIX}/organizations", tags=["organizations"])
+app.include_router(departments.router, prefix=f"{settings.API_PREFIX}/departments", tags=["departments"])
 app.include_router(meetings.router, prefix=f"{settings.API_PREFIX}/meetings", tags=["meetings"])
 app.include_router(agent_library.router, prefix=f"{settings.API_PREFIX}/agent-library", tags=["agent-library"])
 app.include_router(minutes_library.router, prefix=f"{settings.API_PREFIX}/minutes", tags=["minutes"])

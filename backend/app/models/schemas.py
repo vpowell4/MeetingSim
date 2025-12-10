@@ -5,6 +5,68 @@ from datetime import datetime
 from enum import Enum
 
 
+# ============ Enum Schemas ============
+
+class UserRoleEnum(str, Enum):
+    SUPER = "super"
+    ADMIN = "admin"
+    MANAGER = "manager"
+    USER = "user"
+
+
+# ============ Organization Schemas ============
+
+class OrganizationBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class OrganizationCreate(OrganizationBase):
+    pass
+
+
+class OrganizationUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class OrganizationResponse(OrganizationBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+# ============ Department Schemas ============
+
+class DepartmentBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class DepartmentCreate(DepartmentBase):
+    organization_id: int
+
+
+class DepartmentUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class DepartmentResponse(DepartmentBase):
+    id: int
+    organization_id: int
+    is_active: bool
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
 # ============ User Schemas ============
 
 class UserBase(BaseModel):
@@ -14,6 +76,11 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=8, max_length=72)
+    role: Optional[UserRoleEnum] = UserRoleEnum.USER
+    organization_id: Optional[int] = None
+    department_id: Optional[int] = None
+    title: Optional[str] = None
+    phone: Optional[str] = None
     
     @field_validator('password')
     @classmethod
@@ -31,13 +98,45 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserProfileUpdate(BaseModel):
+    full_name: Optional[str] = None
+    title: Optional[str] = None
+    phone: Optional[str] = None
+    organization_id: Optional[int] = None
+    department_id: Optional[int] = None
+
+
+class UserAdminUpdate(BaseModel):
+    full_name: Optional[str] = None
+    role: Optional[UserRoleEnum] = None
+    organization_id: Optional[int] = None
+    department_id: Optional[int] = None
+    title: Optional[str] = None
+    phone: Optional[str] = None
+    is_active: Optional[bool] = None
+    allowed_share_users: Optional[List[int]] = None
+    allowed_share_orgs: Optional[List[int]] = None
+    allowed_share_depts: Optional[List[int]] = None
+
+
 class UserResponse(UserBase):
     id: int
+    role: UserRoleEnum
+    organization_id: Optional[int] = None
+    department_id: Optional[int] = None
+    title: Optional[str] = None
+    phone: Optional[str] = None
     is_active: bool
     created_at: datetime
     
     class Config:
         from_attributes = True
+
+
+class UserDetailResponse(UserResponse):
+    allowed_share_users: Optional[List[int]] = None
+    allowed_share_orgs: Optional[List[int]] = None
+    allowed_share_depts: Optional[List[int]] = None
 
 
 class Token(BaseModel):
@@ -117,6 +216,7 @@ class MeetingResponse(BaseModel):
     status: str
     decision: Optional[str] = None
     summary: Optional[str] = None
+    run_count: int = 0
     created_at: datetime
     completed_at: Optional[datetime] = None
     
@@ -157,7 +257,26 @@ class AgentProfileCreate(BaseModel):
         default_factory=lambda: {
             "interrupt": 0.2,
             "conflict_avoid": 0.5,
-            "persuasion": 0.5
+            "persuasion": 0.5,
+            "assertiveness": 0.5,
+            "cooperation": 0.5,
+            "analytical": 0.5,
+            "emotional": 0.5,
+            "risk_tolerance": 0.5,
+            "creativity": 0.5,
+            "detail_oriented": 0.5,
+            "big_picture": 0.5
+        }
+    )
+    goals: Optional[Dict[str, List[Dict]]] = None  # {"goals": [{"text": "...", "importance": 80, "perspectives": [...]}]}
+    criteria: Optional[Dict[str, float]] = Field(
+        default_factory=lambda: {
+            "cost": 0.5,
+            "risk": 0.5,
+            "speed": 0.5,
+            "fairness": 0.5,
+            "innovation": 0.5,
+            "consensus": 0.5
         }
     )
 
@@ -169,6 +288,8 @@ class AgentProfileUpdate(BaseModel):
     default_stance: Optional[str] = Field(None, pattern="^(for|against|neutral)$")
     default_dominance: Optional[float] = Field(None, ge=0.1, le=3.0)
     traits: Optional[Dict[str, float]] = None
+    goals: Optional[Dict[str, List[Dict]]] = None
+    criteria: Optional[Dict[str, float]] = None
 
 
 class AgentProfileResponse(BaseModel):
@@ -180,8 +301,41 @@ class AgentProfileResponse(BaseModel):
     default_stance: str
     default_dominance: float
     traits: Dict[str, float]
+    goals: Optional[Dict[str, List[Dict]]] = None
+    criteria: Optional[Dict[str, float]] = None
     created_at: datetime
     updated_at: Optional[datetime]
+    is_archived: bool = False
+    
+    class Config:
+        from_attributes = True
+
+
+# ============ Meeting Share Schemas ============
+
+class MeetingShareCreate(BaseModel):
+    meeting_id: int
+    user_emails: List[str] = Field(..., min_items=1)
+
+
+class MeetingShareResponse(BaseModel):
+    id: int
+    meeting_id: int
+    shared_with_user_id: int
+    shared_with_email: Optional[str] = None
+    shared_with_name: Optional[str] = None
+    is_archived: bool
+    shared_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class MeetingResponseWithSharing(MeetingResponse):
+    is_shared: bool = False  # True if viewing a shared meeting
+    is_owner: bool = True    # True if current user owns the meeting
+    shared_by: Optional[str] = None  # Email of owner if shared
+    is_archived: bool = False  # True if user archived this shared meeting
     
     class Config:
         from_attributes = True
